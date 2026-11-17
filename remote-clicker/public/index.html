@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote Clicker</title>
+<style>
+  :root {
+    --bg: #0f1222; --panel: #171b31; --line: #2a3052; --text: #e7e9f5; --muted: #8d93b5;
+    --accent: #4f8cff; --ok: #3ddc84; --bad: #ff5c6c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; }
+  input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  button { cursor: pointer; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+  main { display: flex; flex-direction: column; align-items: center; padding: 20px 16px; gap: 12px; }
+  #stage { width: min(100%, 50vw); min-width: min(100%, 480px); }
+  #box {
+    position: relative; width: 100%; aspect-ratio: 16 / 10; background: #0a0d1a;
+    border: 2px solid var(--line); border-radius: 12px; cursor: crosshair; overflow: hidden; user-select: none;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 10% 10%; background-position: -1px -1px;
+  }
+  #box.disabled { cursor: not-allowed; opacity: .55; }
+  #coords { position: absolute; left: 8px; bottom: 6px; color: var(--muted); font-size: 12px; pointer-events: none; }
+  .ripple { position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%; border: 2px solid var(--accent); pointer-events: none; animation: rip .5s ease-out forwards; }
+  .ripple.right { border-color: #ffb84f; }
+  .ripple.acked { border-color: var(--ok); }
+  @keyframes rip { from { transform: scale(.4); opacity: 1; } to { transform: scale(2.2); opacity: 0; } }
+  .row { display: flex; gap: 14px; align-items: center; color: var(--muted); flex-wrap: wrap; justify-content: center; }
+  #log { width: min(100%, 50vw); min-width: min(100%, 480px); color: var(--muted); font: 12px ui-monospace, Menlo, monospace; max-height: 120px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Remote Clicker</h1>
+  <input id="room" placeholder="Room code" size="12">
+  <input id="key" type="password" placeholder="Access key" size="16">
+  <button id="connect">Connect</button>
+  <span class="pill"><span id="dot" class="dot"></span><span id="status">offline</span></span>
+  <span class="pill">ping <b id="ping">–</b></span>
+  <select id="target" title="Which computer to click on"><option value="">All computers</option></select>
+</header>
+<main>
+  <div id="stage"><div id="box" class="disabled"><span id="coords"></span></div></div>
+  <div class="row">
+    <span>Left-click = left click · Right-click = right click · Double-click = double click</span>
+  </div>
+  <div id="log"></div>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const box = $("box"), log = $("log");
+  let ws = null, agents = [], seq = 0, pingT = 0;
+  const pending = new Map();
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  };
+  $("room").value = store.get("rc_room");
+  $("key").value = store.get("rc_key");
+
+  function note(t) {
+    const d = document.createElement("div");
+    d.textContent = new Date().toLocaleTimeString() + "  " + t;
+    log.prepend(d);
+    while (log.children.length > 50) log.lastChild.remove();
+  }
+  function setStatus(on, text) {
+    $("dot").classList.toggle("on", on);
+    $("status").textContent = text;
+  }
+
+  function renderAgents() {
+    const sel = $("target"), cur = sel.value;
+    sel.innerHTML = '<option value="">All computers (' + agents.length + ')</option>';
+    for (const a of agents) {
+      const o = document.createElement("option");
+      o.value = a.id; o.textContent = (a.name || a.id) + (a.w ? ` (${a.w}×${a.h})` : "");
+      sel.appendChild(o);
+    }
+    sel.value = agents.some((a) => a.id === cur) ? cur : "";
+    const a = agents.find((x) => x.id === sel.value) || agents[0];
+    if (a && a.w && a.h) box.style.aspectRatio = `${a.w} / ${a.h}`;   // box matches remote screen shape
+    box.classList.toggle("disabled", !agents.length);
+    setStatus(ws && ws.readyState === 1, agents.length ? `${agents.length} computer(s) online` : "connected – no computer running the agent");
+  }
+  $("target").onchange = renderAgents;
+
+  function connect() {
+    const room = $("room").value.trim(), key = $("key").value;
+    if (!room || !key) return note("enter a room code and access key");
+    store.set("rc_room", room); store.set("rc_key", key);
+    if (ws) ws.close();
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const server = window.RELAY_URL || `${proto}://${location.host}`;
+    ws = new WebSocket(`${server}/ws?role=controller&room=${encodeURIComponent(room)}&key=${encodeURIComponent(key)}`);
+    setStatus(false, "connecting…");
+    ws.onopen = () => { note("connected to room " + room); renderAgents(); };
+    ws.onclose = (e) => {
+      setStatus(false, e.code === 4001 ? "wrong access key" : "offline");
+      agents = []; box.classList.add("disabled");
+      if (e.code !== 4001) setTimeout(() => { if (!ws || ws.readyState > 1) connect(); }, 2000);
+    };
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === "agents") { agents = m.agents; renderAgents(); }
+      else if (m.type === "pong") $("ping").textContent = Math.round(performance.now() - m.t) + " ms";
+      else if (m.type === "ack") {
+        const p = pending.get(m.id);
+        if (p) { p.el.classList.add("acked"); note(`clicked in ${Math.round(performance.now() - p.t)} ms`); pending.delete(m.id); }
+      }
+    };
+  }
+  $("connect").onclick = connect;
+  if ($("room").value && $("key").value) connect();
+  setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ping", t: performance.now() })); }, 2000);
+
+  function norm(e) {
+    const r = box.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+      px: e.clientX - r.left, py: e.clientY - r.top,
+    };
+  }
+  function fire(e, button, dbl) {
+    if (!ws || ws.readyState !== 1 || !agents.length) return;
+    const p = norm(e), id = ++seq;
+    ws.send(JSON.stringify({ type: "click", x: p.x, y: p.y, button, double: dbl, id, target: $("target").value || undefined }));
+    const el = document.createElement("div");
+    el.className = "ripple" + (button === "right" ? " right" : "");
+    el.style.left = p.px + "px"; el.style.top = p.py + "px";
+    box.appendChild(el); setTimeout(() => el.remove(), 600);
+    pending.set(id, { t: performance.now(), el });
+    if (pending.size > 100) pending.delete(pending.keys().next().value);
+  }
+
+  box.addEventListener("mousemove", (e) => {
+    const p = norm(e);
+    const a = agents.find((x) => x.id === $("target").value) || agents[0];
+    $("coords").textContent = a && a.w ? `${Math.round(p.x * a.w)}, ${Math.round(p.y * a.h)}` : `${(p.x * 100).toFixed(1)}%, ${(p.y * 100).toFixed(1)}%`;
+  });
+  box.addEventListener("mouseleave", () => ($("coords").textContent = ""));
+  box.addEventListener("click", (e) => { if (e.detail === 1) fire(e, "left", false); });
+  box.addEventListener("dblclick", (e) => fire(e, "left", true));
+  box.addEventListener("contextmenu", (e) => { e.preventDefault(); fire(e, "right", false); });
+})();
+</script>
+</body>
+</html>
